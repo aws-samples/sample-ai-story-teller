@@ -1,6 +1,6 @@
 ## My Project
 
-TODO: Fill this README out!
+TODO: Automated storytelling platform using AWS Bedrock that transforms user topics into animated, narrated stories through orchestrated multimodal AI workflows.
 
 Be sure to:
 
