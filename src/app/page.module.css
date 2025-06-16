@@ -1,0 +1,369 @@
+.navbar {
+    background-color: #0070f3;
+    padding: 1rem 0;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 1000;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  }
+  
+  .navContent {
+    max-width: 100%;
+    margin: 0 auto;
+    padding: 0 2rem;
+  }
+  
+  .navTitle {
+    color: white;
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 600;
+  }
+  
+  .main {
+    min-height: 100vh;
+    background-color: #f5f5f5;
+    padding-top: 64px;
+  }
+  
+  .container {
+    display: flex;
+    min-height: calc(100vh - 64px);
+    max-height: calc(100vh - 64px);
+  }
+  
+  .leftColumn {
+    width: 70%;
+    display: flex;
+    flex-direction: column;
+    padding: 20px;
+  }
+  
+  .rightColumn {
+    width: 30%;
+    background-color: white;
+    border-left: 1px solid #eaeaea;
+  }
+  
+  .videoSection {
+    height: 70%;
+    margin-bottom: 20px;
+  }
+  
+  .videoWrapper {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    background-color: #000;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  
+  .videoWrapper iframe {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    border: none;
+  }
+  
+  .inputSection {
+    height: 30%;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+  
+.textareaContainer {
+  position: relative;
+  width: 80%;
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+}
+
+.promptInput {
+  flex-grow: 1;
+  padding: 1rem;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  resize: none;
+  font-size: 1.5rem;
+  min-height: 100px;
+  width: 100%;
+  font-family: 'Comic Neue', 'Patrick Hand', 'Short Stack', 'Comic Sans MS', 'Chalkboard SE', 'Bradley Hand', cursive;
+}
+
+.wordCount {
+  position: absolute;
+  bottom: 0.5rem;
+  right: 0.5rem;
+  font-size: 0.8rem;
+  color: #666;
+  background-color: rgba(255, 255, 255, 0.8);
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+}
+  
+  .buttonGroup {
+    display: flex;
+    gap: 1rem;
+    align-self: center;
+  }
+  
+  .button {
+    padding: 0.75rem 1.5rem;
+    border: none;
+    border-radius: 8px;
+    background-color: #0070f3;
+    color: white;
+    cursor: pointer;
+    transition: background-color 0.2s;
+  }
+  
+  .button:hover {
+    background-color: #0051a2;
+  }
+  
+  .button:disabled {
+    background-color: #ccc;
+    cursor: not-allowed;
+  }
+  
+  .button svg {
+    width: 20px;
+    height: 20px;
+  }
+  
+  .recording {
+    background-color: #dc3545;
+    padding: 0.75rem;
+  }
+  
+  .recording:hover {
+    background-color: #bb2d3b;
+  }
+  
+  .storiesList {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: 20px;
+  }
+  
+  .storiesList h2 {
+    margin-bottom: 20px;
+  }
+  
+  .storiesScroll {
+    flex-grow: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding-right: 10px;
+  }
+  
+  .storiesScroll::-webkit-scrollbar {
+    width: 6px;
+  }
+  
+  .storiesScroll::-webkit-scrollbar-track {
+    background: #f1f1f1;
+    border-radius: 3px;
+  }
+  
+  .storiesScroll::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 3px;
+  }
+  
+  .storiesScroll::-webkit-scrollbar-thumb:hover {
+    background: #555;
+  }
+  
+  .storyItemContainer {
+  display: flex;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.storyItem {
+  flex: 1;
+  padding: 1rem;
+  background-color: white;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 0.2s;
+  margin-right: 0.5rem;
+  position: relative; /* Added for tooltip positioning */
+}
+
+/* Tooltip for showing full prompt on hover */
+.storyItem:hover::after {
+  content: attr(data-full-prompt);
+  position: absolute;
+  left: 0;
+  top: 100%;
+  background-color: #333;
+  color: white;
+  padding: 0.5rem;
+  border-radius: 4px;
+  z-index: 1000;
+  width: 100%;
+  max-width: 300px;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+  font-size: 0.9rem;
+  white-space: normal;
+  word-wrap: break-word;
+}
+
+.storyItem:hover {
+  background-color: #f0f0f0;
+}
+
+.activeStory {
+  background-color: #e6f0ff;
+  border-color: #0070f3;
+}
+
+.qrButton {
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background-color: #0070f3;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.qrButton:hover {
+  background-color: #0051a2;
+}
+
+.qrButton svg {
+  width: 18px;
+  height: 18px;
+}
+  
+  /* Responsive adjustments */
+  @media (max-width: 1024px) {
+    .container {
+      flex-direction: column;
+    }
+  
+    .leftColumn,
+    .rightColumn {
+      width: 100%;
+    }
+  
+    .rightColumn {
+      height: 300px;
+      border-left: none;
+      border-top: 1px solid #eaeaea;
+    }
+  }
+  .statusIndicator {
+    font-size: 0.8em;
+    font-style: italic;
+    margin-left: 5px;
+  }
+  
+  
+  /* Status indicator dots */
+.statusDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-left: 8px;
+  vertical-align: middle;
+  float: right;
+}
+
+.runningDot {
+  background-color: orange;
+  animation: blink 1s infinite;
+}
+
+.completedDot {
+  background-color: green;
+}
+
+.failedDot {
+  background-color: red;
+}
+
+@keyframes blink {
+  0% { opacity: 0.4; }
+  50% { opacity: 1; }
+  100% { opacity: 0.4; }
+}
+
+/* QR Code Modal Styles */
+.modalOverlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+}
+
+.modalContent {
+  background-color: white;
+  border-radius: 8px;
+  padding: 2rem;
+  max-width: 90%;
+  width: 400px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.modalHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1.5rem;
+}
+
+.modalHeader h3 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.closeButton {
+  background: none;
+  border: none;
+  font-size: 1.5rem;
+  cursor: pointer;
+  padding: 0;
+  color: #666;
+}
+
+.qrCodeContainer {
+  display: flex;
+  justify-content: center;
+  margin: 1.5rem 0;
+  padding: 1rem;
+  background-color: white;
+  border-radius: 8px;
+}
+
+.modalInstructions {
+  text-align: center;
+  color: #666;
+  margin-top: 1.5rem;
+  font-size: 0.9rem;
+}

@@ -1,0 +1,4 @@
+Template: template.yaml
+Parameters:
+  SourceBucketName: aistorytellersource713514912627
+  DestinationBucketName: aistorytellerdestination713514912627

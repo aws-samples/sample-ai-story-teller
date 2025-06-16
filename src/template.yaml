@@ -1,0 +1,1526 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Template for API Gateway triggering Step Function with Lambda steps and Audio-Video processing'
+
+Parameters:
+  SourceBucketName:
+    Type: String
+    Description: Name of the source S3 bucket for images
+  DestinationBucketName:
+    Type: String
+    Description: Name of the destination S3 bucket for videos
+
+
+Resources:
+  # S3 Buckets
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SourceBucketName
+
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DestinationBucketName
+
+
+  # MediaConvert Role
+  MediaConvertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: mediaconvert.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MediaConvertServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:HeadObject
+                Resource:
+                  - !Sub arn:aws:s3:::${SourceBucketName}
+                  - !Sub arn:aws:s3:::${SourceBucketName}/*
+                  - !Sub arn:aws:s3:::${SourceBucketName}/*/*
+                  - !Sub arn:aws:s3:::${DestinationBucketName}
+                  - !Sub arn:aws:s3:::${DestinationBucketName}/*
+                  - !Sub arn:aws:s3:::${DestinationBucketName}/*/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+
+  # Audio Merger Lambda Role
+  AudioMergerLambdaRole:
+    Type: AWS::IAM::Role
+    DependsOn: MediaConvertRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AndMediaConvertAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:HeadObject
+                Resource: 
+                  - !Sub ${SourceBucket.Arn}/*
+                  - !Sub ${DestinationBucket.Arn}/*
+                  - !Sub ${SourceBucket.Arn}
+                  - !Sub ${DestinationBucket.Arn}
+              - Effect: Allow
+                Action:
+                  - polly:StartSpeechSynthesisTask
+                  - polly:GetSpeechSynthesisTask
+                  - polly:ListSpeechSynthesisTasks
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - mediaconvert:CreateJob
+                  - mediaconvert:GetJob
+                  - mediaconvert:DescribeEndpoints
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt MediaConvertRole.Arn
+
+
+  # Lambda Roles
+  FirstLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AndBedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub ${SourceBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:Converse
+                Resource: '*'
+
+  SecondLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AndBedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: 
+                  - !Sub ${SourceBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource: 
+                  - !Sub ${DestinationBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:StartAsyncInvoke
+                  - bedrock:GetAsyncInvoke
+                Resource: '*'
+
+  # Lambda Functions
+  FirstLambda:
+      Type: AWS::Lambda::Function
+      DependsOn:
+        - VideoGeneratorRole
+        - SourceBucket
+      Properties:
+        FunctionName: StoryGeneratorFunction
+        Handler: index.handler
+        Role: !GetAtt VideoGeneratorRole.Arn
+        Runtime: python3.9
+        Timeout: 900
+        MemorySize: 1024
+        Environment:
+          Variables:
+            BUCKET_NAME: !Ref SourceBucketName
+        Code:
+          ZipFile: |
+            import json
+            import boto3
+            import base64
+            import time
+            from botocore.config import Config
+            from datetime import datetime
+            import uuid
+            import re
+            import os
+            import logging
+
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+
+            BUCKET_NAME = os.environ['BUCKET_NAME']
+            TARGET_WIDTH = 1280
+            TARGET_HEIGHT = 720
+
+            bedrock = boto3.client(
+                service_name='bedrock-runtime',
+                region_name="us-east-1",
+                config=Config(read_timeout=300)
+            )
+            s3 = boto3.client('s3')
+
+            def sanitize_topic(topic):
+                sanitized = topic.lower().replace(' ', '_')
+                sanitized = re.sub(r'[^a-z0-9_]', '', sanitized)
+                return sanitized[:30]
+
+            def generate_story_id(topic):
+                date_str = datetime.now().strftime('%Y%m%d')
+                topic_str = sanitize_topic(topic)
+                unique_id = str(uuid.uuid4())[:6]
+                return f"{date_str}_{topic_str}_{unique_id}"
+
+            def save_image_to_s3(image_base64, story_id, scene_number):
+                try:
+                    image_data = base64.b64decode(image_base64)
+                    key = f"{story_id}/scene_{scene_number}.png"
+                    current_time = datetime.now().isoformat()  
+                    s3.put_object(
+                        Bucket=BUCKET_NAME,
+                        Key=key,
+                        Body=image_data,
+                        ContentType='image/png',
+                        Metadata={
+                            'created-date': current_time,
+                            'last-modified-date': current_time
+                        }
+                    )
+                    
+                    url = f"s3://{BUCKET_NAME}/{key}"
+                    return url
+                except Exception as e:
+                    logger.error(f"Error saving image to S3: {str(e)}")
+                    return None
+
+            def generate_story_description(full_text):
+                  """
+                  Generates a 30-second narrative from the full story text using Claude
+                  """
+                  try:
+                      prompt = f"""Create a concise, engaging 30-second narration from this story. 
+                      Focus on the main character's journey and key moments.
+                      The narration should flow naturally and be suitable for voice-over.
+                      Keep it under 100 words while maintaining story impact.
+
+                      Story text:
+                      {full_text}
+
+                      Requirements:
+                      - Start with an engaging introduction of the main character
+                      - Highlight 2-3 key moments
+                      - End with the resolution
+                      - Use natural, conversational language
+                      - Maintain emotional connection
+                      - Keep it concise for 30-second narration
+
+                      Format: Single paragraph narrative suitable for voice-over."""
+
+                      conversation = [
+                          {
+                              "role": "user",
+                              "content": [{"text": prompt}],
+                          }
+                      ]
+
+                      response = bedrock.converse(
+                          modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+                          messages=conversation,
+                          inferenceConfig={
+                              "maxTokens": 200,
+                              "temperature": 0.7,
+                              "topP": 0.9
+                          }
+                      )
+
+                      narrative = response["output"]["message"]["content"][0]["text"].strip()
+                      return narrative
+
+                  except Exception as e:
+                      print(f"Error generating story description: {str(e)}")
+                      return "A story unfolds across five scenes."
+
+            def generate_story_steps(user_input):
+                try:
+                    enhanced_prompt = f"""Create 5 sequential scenes telling a story about: {user_input}
+
+            Story arc requirements:
+            1. Scene 1 (Introduction): Establish main character and setting, introduce the basic situation
+            2. Scene 2 (Rising Action): Show first challenge or development
+            3. Scene 3 (Rising Action): Increase tension or progress
+            4. Scene 4 (Climax): Show the peak moment or main achievement
+            5. Scene 5 (Resolution): Show the outcome or conclusion
+
+            Format each scene as:
+            Scene X: [Shot type] - [Character details] - [Action] - [Setting] - [Lighting]
+
+            Character consistency:
+            - Maintain exact same character description across all scenes
+            - Format: Name (age gender, hair length, facial features, physical details, clothing, country of origin)
+            - Maximum 3 characters per scene
+
+            Technical requirements:
+            - Each scene under 20 words
+            - Include shot type (Close-up, Medium, Wide, Full)
+            - Clear lighting conditions
+            - Single focused action
+            - Simple setting
+            
+            Example story arc for "Learning to Ride a Bike":
+            Scene 1: Medium shot - Tommy (8 year old male, short blonde hair, freckled face, slim build, blue shirt, USA) - nervously examining new bike - driveway - morning light
+            Scene 2: Wide shot - Tommy(8 year old male, short blonde hair, freckled face, slim build, blue shirt, USA) with Dad (50 year male, balding grey hair, square jaw, athletic build, grey shirt, USA) - attempting first pedal - driveway - bright sunlight
+            Scene 3: Full shot - Tommy(8 year old male, short blonde hair, freckled face, slim build, blue shirt, USA) - wobbling but pedaling alone - sidewalk - afternoon sun
+            Scene 4: Medium shot - Tommy(8 year old male, short blonde hair, freckled face, slim build, blue shirt, USA) - confidently riding through finish line - park path - golden hour
+            Scene 5: Close-up - Tommy(8 year old male, short blonde hair, freckled face, slim build, blue shirt, USA) - smiling triumphantly beside bike - driveway - sunset glow
+
+            Important:
+            - Each scene must advance the story
+            - Maintain visual continuity
+            - Show clear progression
+            - Keep descriptions concise and image-friendly"""
+
+                    conversation = [
+                        {
+                            "role": "user",
+                            "content": [{"text": enhanced_prompt}],
+                        }
+                    ]
+
+                    response = bedrock.converse(
+                        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+                        messages=conversation,
+                        inferenceConfig={
+                            "maxTokens": 300,
+                            "temperature": 0.7,
+                            "topP": 0.9,
+                            "stopSequences": ["Scene 6"]
+                        }
+                    )
+
+                    story_text = response["output"]["message"]["content"][0]["text"]
+                    scene_pattern = re.compile(r'(?:Scene\s*\d+|###\s*Scene\s*\d+|\d+\.)')
+                    raw_scenes = re.split(scene_pattern, story_text)
+                    scenes = [scene.strip() for scene in raw_scenes if scene.strip()]
+                    scenes = [re.sub(r'^.{1,30}:?\s*\n', '', scene).strip() for scene in scenes]
+                    scenes = scenes[:5]
+                    
+                    while len(scenes) < 5:
+                        scenes.append(f"Scene {len(scenes) + 1} about {user_input}")
+                        
+                    return {
+                        'scenes': scenes,
+                        'full_text': story_text
+                    }
+                    
+                except Exception as e:
+                    logger.error(f"Error in generate_story_steps: {str(e)}")
+                    default_scenes = [f"Scene {i} about {user_input}" for i in range(1, 6)]
+                    return {
+                        'scenes': default_scenes,
+                        'full_text': '\n'.join(default_scenes)
+                    }
+
+            def image_from_text(text):
+                body = json.dumps({
+                    "taskType": "TEXT_IMAGE",
+                    "textToImageParams": {
+                        "text": text,
+                        "negativeText": "blurry, distorted, melting, overlapping elements, cartoon, anime, illustration, drawing, painted, artistic, sketchy, comic book style, cel shading, unrealistic, low quality, artificial, inconsistent appearances, changing features, morphing characters, animation style"
+                    },
+                    "imageGenerationConfig": {
+                        "numberOfImages": 1,
+                        "width": TARGET_WIDTH,
+                        "height": TARGET_HEIGHT,
+                        "cfgScale": 8.0,
+                        "seed": 0
+                    }
+                })
+
+                response = bedrock.invoke_model(
+                    body=body,
+                    modelId="amazon.nova-canvas-v1:0",
+                    accept="application/json",
+                    contentType="application/json"
+                )
+                
+                response_body = json.loads(response.get("body").read())
+                return response_body.get("images")[0]
+
+            def save_metadata_to_s3(story_id, metadata, scenes):
+                try:
+                    metadata['image_resolution'] = {
+                        'width': TARGET_WIDTH,
+                        'height': TARGET_HEIGHT
+                    }
+                    
+                    s3.put_object(
+                        Bucket=BUCKET_NAME,
+                        Key=f"{story_id}/metadata.json",
+                        Body=json.dumps(metadata),
+                        ContentType='application/json'
+                    )
+
+                    scenes_data = {
+                        f"shot{i+1}_text": scene
+                        for i, scene in enumerate(scenes)
+                    }
+
+                    current_time = datetime.now().isoformat()  
+                    s3.put_object(
+                        Bucket=BUCKET_NAME,
+                        Key=f"{story_id}/scenes.json",
+                        Body=json.dumps(scenes_data, indent=2),
+                        ContentType='application/json',
+                        Metadata={
+                            'created-date': current_time,
+                            'last-modified-date': current_time
+                        }
+                    )
+                    
+                    return True
+                except Exception as e:
+                    logger.error(f"Error saving metadata to S3: {str(e)}")
+                    return False
+
+            def handler(event, context):
+                try:
+                    if isinstance(event, dict):
+                        if 'body' in event:
+                            body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                        else:
+                            body = event
+                    else:
+                        body = json.loads(event)
+
+                    user_input = body.get('topic')
+                    if not user_input:
+                        raise ValueError("Topic is required")
+                    
+                    story_id = generate_story_id(user_input)
+                    logger.info(f"Generating story for topic: {user_input}")
+                    
+                    story_data = generate_story_steps(user_input)
+                    scenes = story_data['scenes']
+                    full_text = story_data['full_text']
+                    
+                    polly_input = generate_story_description(full_text)
+                    
+                    logger.info("Generating images for scenes")
+                    images = []
+                    image_urls = []
+                    
+                    metadata = {
+                        'story_id': story_id,
+                        'topic': user_input,
+                        'creation_date': datetime.now().isoformat(),
+                        'scene_count': len(scenes),
+                        'image_urls': image_urls
+                    }
+                    
+                    save_metadata_to_s3(story_id, metadata, scenes)
+                    
+                    for idx, scene in enumerate(scenes):
+                        logger.info(f"Generating image {idx + 1}/5")
+                        
+                        scene_number = idx + 1
+                        scene_context = f"""Scene {scene_number} of 5:
+                        {scene} """
+                        
+                        if idx > 0:
+                          time.sleep(2)  # Rate limiting between API calls
+                      
+                        try:
+                            image_base64 = image_from_text(scene_context)
+                            image_url = save_image_to_s3(
+                                image_base64,
+                                story_id,
+                                scene_number
+                            )
+                            
+                            if image_url:
+                                images.append(image_base64)
+                                image_urls.append(image_url)
+                            else:
+                                raise Exception(f"Failed to save image {scene_number} to S3")
+                            
+                        except Exception as img_error:
+                            print(f"Error generating image {scene_number}: {str(img_error)}")
+                            # Continue with remaining scenes even if one fails
+                            continue
+                    
+                    metadata['generated_images'] = len(images)
+                    metadata['image_urls'] = image_urls
+                    
+                    save_metadata_to_s3(story_id, metadata, scenes)
+                    
+                    response_data = {
+                        'story_id': story_id,
+                        'topic': user_input,
+                        'scenes': scenes,
+                        'full_text': full_text,
+                        'image_urls': image_urls,
+                        'metadata': metadata,
+                        'polly_input': polly_input
+                    }
+
+                    return response_data
+
+                except Exception as e:
+                    error_message = str(e)
+                    logger.error(f"Error in handler: {error_message}")
+                    
+                    return {
+                        'error': error_message,
+                        'error_type': type(e).__name__,
+                        'timestamp': datetime.now().isoformat()
+                    }
+      # Second Lambda Function
+  SecondLambda:
+      Type: AWS::Lambda::Function
+      DependsOn:
+        - SecondLambdaRole
+        - SourceBucket
+        - DestinationBucket
+      Properties:
+        FunctionName: VideoGeneratorFunction
+        Handler: index.handler
+        Role: !GetAtt SecondLambdaRole.Arn
+        Runtime: python3.9
+        Timeout: 900
+        MemorySize: 1024
+        Environment:
+          Variables:
+            SOURCE_BUCKET: !Ref SourceBucketName
+            DESTINATION_BUCKET: !Ref DestinationBucketName
+        Code:
+          ZipFile: |
+            import json
+            import boto3
+            import os
+            import time
+            import logging
+            from typing import Dict, Any, Tuple
+            from urllib.parse import unquote_plus
+
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+            SLEEP_SECONDS = 15
+            MAX_MONITORING_TIME = 900
+            INPUT_BUCKET = os.environ['SOURCE_BUCKET']
+            OUTPUT_BUCKET = os.environ['DESTINATION_BUCKET']
+
+            def extract_job_id(response):
+                """Extract job ID from Bedrock response"""
+                try:
+                    # The requestToken in the response contains the job ID
+                    request_token = response.get('requestToken')
+                    if request_token:
+                        return request_token.split('-')[0]  # First part of the token is the job ID
+                    
+                    # Alternative: try getting from invocationId
+                    invocation_id = response.get('invocationId')
+                    if invocation_id:
+                        return invocation_id
+                    
+                    # If neither is available, use part of the invocationArn
+                    invocation_arn = response.get('invocationArn', '')
+                    return invocation_arn.split('/')[-1]
+                    
+                except Exception as e:
+                    logger.error(f"Error extracting job ID: {str(e)}")
+                    return None
+
+            def handler(event, context):
+                s3_client = boto3.client('s3')
+                bedrock_client = boto3.client('bedrock-runtime')
+                
+                try:
+                    if isinstance(event, dict):
+                        if 'body' in event:
+                            body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                        else:
+                            body = event
+                    else:
+                        body = json.loads(event)
+
+                    story_id = body.get('story_id')
+                    if not story_id:
+                        raise ValueError("story_id is required")
+
+                    logger.info(f"Processing story_id: {story_id}")
+
+                    scene_json_response = s3_client.get_object(
+                        Bucket=INPUT_BUCKET,
+                        Key=f"{story_id}/scenes.json"
+                    )
+                    scene_data = json.loads(scene_json_response['Body'].read().decode('utf-8'))
+                    
+                    shots = []
+                    for i in range(1, 6):
+                        image_key = f"{story_id}/scene_{i}.png"
+                      
+                        # Check if the image exists in S3
+                        try:
+                            # Try to head the object to check if it exists
+                            s3_client.head_object(Bucket=INPUT_BUCKET, Key=image_key)
+                          
+                            # Image exists, add it to shots
+                            shot = {
+                                "text": scene_data[f"shot{i}_text"].strip() + ", please keep eyes movement and facial expressions natural.",
+                                "image": {
+                                    "format": "png",
+                                    "source": {
+                                        "s3Location": {
+                                            "uri": f"s3://{INPUT_BUCKET}/{image_key}"
+                                        }
+                                    }
+                                }
+                            }
+                            shots.append(shot)
+                            valid_shots_count += 1
+                            logger.info(f"Added scene {i} to shots list")
+                          
+                        except Exception as e:
+                              logger.warning(f"Image for scene {i} not found: {str(e)}")
+                              # Skip this shot
+                              continue                  
+                    request_body = {
+                        "taskType": "MULTI_SHOT_MANUAL",
+                        "multiShotManualParams": {
+                            "shots": shots
+                        },
+                        "videoGenerationConfig": {
+                            "fps": 24,
+                            "dimension": "1280x720",
+                            "seed": 42
+                        }
+                    }
+                    
+                    logger.info(f"Request body: {json.dumps(request_body, indent=2)}")
+                    
+                    # Start async video generation
+                    invoke_response = bedrock_client.start_async_invoke(
+                        modelId='amazon.nova-reel-v1:1',
+                        modelInput=request_body,
+                        outputDataConfig={
+                            "s3OutputDataConfig": {
+                                "s3Uri": f"s3://{OUTPUT_BUCKET}/{story_id}/"
+                            }
+                        }
+                    )
+                    
+                    # Extract job ID and invocation ARN
+                    job_id = extract_job_id(invoke_response)
+                    invocation_arn = invoke_response["invocationArn"]
+                    
+                    logger.info(f"Started async job with ID: {job_id}")
+                    logger.info(f"Invocation ARN: {invocation_arn}")
+                    
+                    status, output_location = monitor_video_generation(
+                        bedrock_client, 
+                        invocation_arn, 
+                        story_id,
+                        job_id
+                    )
+
+                    response = {
+                        'status': status,
+                        'story_id': story_id,
+                        'source_bucket': INPUT_BUCKET,
+                        'destination_bucket': OUTPUT_BUCKET,
+                        'output_location': output_location or f"s3://{OUTPUT_BUCKET}/{story_id}/{job_id}/output.mp4",
+                        'job_id': job_id,
+                        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    
+                    if status == "Completed":
+                        response['message'] = 'Video generation completed successfully'
+                    elif status == "Failed":
+                        response['message'] = 'Video generation failed'
+                    elif status == "Timeout":
+                        response['message'] = 'Video generation monitoring timed out'
+                    else:
+                        response['message'] = f'Video generation status: {status}'
+                        
+                    logger.info(f"Final response: {json.dumps(response, default=str)}")
+                    return response
+
+                except Exception as err:
+                    logger.error(f"Error in lambda_handler: {str(err)}", exc_info=True)
+                    return {
+                        'error': str(err),
+                        'status': 'Error',
+                        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+                    }
+
+            def monitor_video_generation(bedrock_client, invocation_arn: str, story_id: str, job_id: str) -> Tuple[str, str]:
+                start_time = time.time()
+                
+                logger.info(f"Monitoring job with ID: {job_id}")
+                expected_path = f"{story_id}/{job_id}/output.mp4"
+                logger.info(f"Expected output path: {expected_path}")
+                
+                while True:
+                    try:
+                        response = bedrock_client.get_async_invoke(invocationArn=invocation_arn)
+                        status = response["status"]
+                        logger.info(f"Status: {status}")
+                        
+                        if status != "InProgress":
+                            break
+                                
+                        if time.time() - start_time > MAX_MONITORING_TIME:
+                            logger.warning("Maximum monitoring time exceeded")
+                            return "Timeout", None
+                                
+                        time.sleep(SLEEP_SECONDS)
+                            
+                    except Exception as e:
+                        logger.error(f"Error monitoring video generation: {str(e)}")
+                        return "Error", None
+
+                if status == "Completed":
+                    output_location = f"s3://{OUTPUT_BUCKET}/{expected_path}"
+                    logger.info(f"Job completed. Output at: {output_location}")
+                    return status, output_location
+                
+                return status, None
+
+  VideoGeneratorRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: VideoGeneratorAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:ListBucket
+                  Resource: 
+                    - !Sub ${SourceBucket.Arn}/*
+                    - !Sub ${SourceBucket.Arn}
+                    - !Sub ${DestinationBucket.Arn}/*
+                    - !Sub ${DestinationBucket.Arn}
+                - Effect: Allow
+                  Action:
+                    - bedrock:InvokeModel
+                    - bedrock:StartAsyncInvoke
+                    - bedrock:GetAsyncInvoke
+                  Resource: '*'
+
+
+    # AudioVideoMerger Function
+  AudioVideoMergerFunction:
+      Type: AWS::Lambda::Function
+      DependsOn:
+        - AudioMergerLambdaRole
+        - MediaConvertRole
+      Properties:
+        FunctionName: AudioVideoMergerFunction
+        Handler: index.lambda_handler
+        Role: !GetAtt AudioMergerLambdaRole.Arn
+        Runtime: python3.9
+        Timeout: 900
+        MemorySize: 1024
+        Environment:
+          Variables:
+            SOURCE_BUCKET: !Ref SourceBucketName
+            DESTINATION_BUCKET: !Ref DestinationBucketName
+            MEDIACONVERT_ROLE_ARN: !GetAtt MediaConvertRole.Arn
+        Code:
+          ZipFile: |
+            import boto3
+            import json
+            import os
+            import time
+            import logging
+            from typing import Dict, Any, Tuple
+            from urllib.parse import unquote_plus
+            from botocore.exceptions import ClientError
+
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+
+            SLEEP_SECONDS = 15
+            MAX_MONITORING_TIME = 900
+            INPUT_BUCKET = os.environ['SOURCE_BUCKET']
+            OUTPUT_BUCKET = os.environ['DESTINATION_BUCKET']
+
+            def get_mediaconvert_endpoint():
+                try:
+                    mediaconvert_client = boto3.client('mediaconvert')
+                    response = mediaconvert_client.describe_endpoints()
+                    return response['Endpoints'][0]['Url']
+                except Exception as e:
+                    logger.error(f"Error getting MediaConvert endpoint: {str(e)}")
+                    raise
+
+            def verify_file_exists(s3_client, bucket, key, max_attempts=10, delay=5):
+                """
+                Verify that a file exists in S3 with retries and alternative extension check
+                """
+                logger.info(f"Verifying file existence - Bucket: {bucket}, Key: {key}")
+                
+                # List of possible file paths to check
+                paths_to_check = [
+                    key,  # Original path
+                    f"{key}.mp4",  # Path with additional .mp4
+                    key[:-4] if key.endswith('.mp4') else f"{key}.mp4"  # Handle both cases
+                ]
+                
+                for path in paths_to_check:
+                    for attempt in range(max_attempts):
+                        try:
+                            s3_client.head_object(Bucket=bucket, Key=path)
+                            logger.info(f"File found at path: {path}")
+                            return True, path
+                        except Exception as e:
+                            if attempt == max_attempts - 1:
+                                logger.info(f"File not found at path: {path}")
+                                continue  # Try next path if available
+                            time.sleep(delay)
+                
+                logger.error(f"File not found in any expected location after {max_attempts} attempts")
+                return False, None
+
+            def wait_for_mediaconvert_job(mediaconvert_client, job_id, max_attempts=30, delay=10):
+                logger.info(f"Waiting for MediaConvert job {job_id} to complete")
+                
+                for attempt in range(max_attempts):
+                    try:
+                        response = mediaconvert_client.get_job(Id=job_id)
+                        status = response['Job']['Status']
+                        
+                        logger.info(f"MediaConvert job status (Attempt {attempt + 1}/{max_attempts}): {status}")
+                        
+                        if status == 'COMPLETE':
+                            logger.info("MediaConvert job completed successfully")
+                            time.sleep(15)  # Added delay after completion
+                            return True, None
+                        elif status in ['ERROR', 'CANCELED']:
+                            error_message = response['Job'].get('ErrorMessage', 'Unknown error')
+                            logger.error(f"MediaConvert job failed: {error_message}")
+                            return False, error_message
+                        
+                        logger.info(f"Waiting {delay} seconds before next check...")
+                        time.sleep(delay)
+                        
+                    except Exception as e:
+                        logger.error(f"Error checking MediaConvert job: {str(e)}")
+                        if attempt == max_attempts - 1:
+                            return False, str(e)
+                        time.sleep(delay)
+                
+                return False, "Timeout waiting for MediaConvert job"
+
+            def get_job_settings():
+                sts_client = boto3.client('sts')
+                account_id = sts_client.get_caller_identity()['Account']
+                region = os.environ.get('AWS_REGION', 'us-east-1')
+                
+                return {
+                    "Queue": f"arn:aws:mediaconvert:{region}:{account_id}:queues/Default",
+                    "UserMetadata": {},
+                    "Role": os.environ['MEDIACONVERT_ROLE_ARN'],
+                    "Settings": {
+                        "TimecodeConfig": {
+                            "Source": "ZEROBASED"
+                        },
+                        "OutputGroups": [
+                            {
+                                "CustomName": "output",
+                                "Name": "File Group",
+                                "Outputs": [
+                                    {
+                                        "ContainerSettings": {
+                                            "Container": "MP4",
+                                            "Mp4Settings": {}
+                                        },
+                                        "VideoDescription": {
+                                            "CodecSettings": {
+                                                "Codec": "H_264",
+                                                "H264Settings": {
+                                                    "MaxBitrate": 5000000,
+                                                    "RateControlMode": "QVBR",
+                                                    "SceneChangeDetect": "TRANSITION_DETECTION"
+                                                }
+                                            }
+                                        },
+                                        "AudioDescriptions": [
+                                            {
+                                                "AudioSourceName": "Audio Selector 2",
+                                                "AudioNormalizationSettings": {
+                                                    "Algorithm": "ITU_BS_1770_3",
+                                                    "AlgorithmControl": "CORRECT_AUDIO",
+                                                    "TargetLkfs": -23
+                                                },
+                                                "CodecSettings": {
+                                                    "Codec": "AAC",
+                                                    "AacSettings": {
+                                                        "Bitrate": 96000,
+                                                        "CodingMode": "CODING_MODE_2_0",
+                                                        "SampleRate": 48000
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                ],
+                                "OutputGroupSettings": {
+                                    "Type": "FILE_GROUP_SETTINGS",
+                                    "FileGroupSettings": {
+                                        "Destination": "",
+                                        "DestinationSettings": {
+                                            "S3Settings": {
+                                                "StorageClass": "STANDARD"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        ],
+                        "Inputs": []
+                    },
+                    "AccelerationSettings": {
+                        "Mode": "DISABLED"
+                    },
+                    "StatusUpdateInterval": "SECONDS_60",
+                    "Priority": 0
+                }
+
+            def get_polly_output_file(s3_client, bucket, prefix, task_id, max_attempts=60, delay=10):
+                logger.info(f"Waiting for Polly file in bucket: {bucket}, prefix: {prefix}, task_id: {task_id}")
+                
+                for attempt in range(max_attempts):
+                    try:
+                        polly_client = boto3.client('polly')
+                        task_status = polly_client.get_speech_synthesis_task(TaskId=task_id)
+                        task_state = task_status['SynthesisTask']['TaskStatus']
+                        
+                        logger.info(f"Polly task status (Attempt {attempt + 1}/{max_attempts}): {task_state}")
+                        
+                        if task_state == 'completed':
+                            output_uri = task_status['SynthesisTask']['OutputUri']
+                            output_key = output_uri.split(bucket + '/')[-1]
+                            logger.info(f"Found Polly output file: {output_key}")
+                            return output_key
+                            
+                        elif task_state == 'failed':
+                            error_message = task_status['SynthesisTask'].get('TaskStatusReason', 'Unknown error')
+                            logger.error(f"Polly task failed: {error_message}")
+                            raise Exception(f"Polly task failed: {error_message}")
+                        
+                        logger.info(f"Polly task still processing. Waiting {delay} seconds...")
+                        time.sleep(delay)
+                        
+                    except Exception as e:
+                        logger.error(f"Error checking Polly file: {str(e)}")
+                        if attempt == max_attempts - 1:
+                            raise
+                        time.sleep(delay)
+                
+                raise Exception(f"Timeout waiting for Polly file after {max_attempts} attempts")
+
+            def lambda_handler(event, context):
+                try:
+                    s3_client = boto3.client('s3')
+                    polly_client = boto3.client('polly')
+                    
+                    endpoint_url = os.environ.get('MEDIACONVERT_ENDPOINT')
+                    if not endpoint_url:
+                        endpoint_url = get_mediaconvert_endpoint()
+                    
+                    mediaconvert_client = boto3.client('mediaconvert', endpoint_url=endpoint_url)
+                    
+                    story_id = event.get('story_id')
+                    polly_input = event.get('polly_input')
+                    video_path = event.get('video_path')
+                    
+                    if not story_id or not polly_input or not video_path:
+                        return {
+                            'statusCode': 400,
+                            'body': {
+                                'message': 'Missing required parameters',
+                                'story_id': story_id
+                            }
+                        }
+                    
+                    video_path = video_path.replace('s3://', '')
+                    video_bucket = video_path.split('/')[0]
+                    path_parts = video_path.split('/')
+                    
+                    video_key = '/'.join(path_parts[1:])
+                    logger.info(f"Parsed video path - Bucket: {video_bucket}, Key: {video_key}")
+
+                    success, actual_video_key = verify_file_exists(s3_client, video_bucket, video_key)
+                    if not success:
+                        alternative_key = f"{story_id}/{video_key}"
+                        logger.info(f"Trying alternative path: {alternative_key}")
+                        
+                        success, actual_video_key = verify_file_exists(s3_client, video_bucket, alternative_key)
+                        if success:
+                            video_key = actual_video_key
+                            logger.info(f"Found video at alternative path")
+                        else:
+                            return {
+                                'statusCode': 500,
+                                'body': {
+                                    'message': f'Input video file not found',
+                                    'story_id': story_id
+                                }
+                            }
+                    
+                    try:
+                        logger.info(f"Starting Polly synthesis for story_id: {story_id}")
+                        
+                        timestamp = int(time.time())
+                        audio_prefix = f"{story_id}/audio/speech_{timestamp}"
+                        
+                        polly_response = polly_client.start_speech_synthesis_task(
+                            Engine='neural',
+                            LanguageCode='en-US',
+                            OutputFormat='mp3',
+                            OutputS3BucketName=OUTPUT_BUCKET,
+                            OutputS3KeyPrefix=audio_prefix,
+                            Text=polly_input,
+                            VoiceId='Ruth',
+                            SampleRate='24000',
+                            TextType='text'
+                        )
+                        
+                        task_id = polly_response['SynthesisTask']['TaskId']
+                        logger.info(f"Polly task started with ID: {task_id}")
+                        
+                        actual_audio_key = get_polly_output_file(
+                            s3_client, 
+                            OUTPUT_BUCKET, 
+                            f"{story_id}/audio/",
+                            task_id,
+                            max_attempts=60,
+                            delay=10
+                        )
+                        
+                        if not actual_audio_key:
+                            return {
+                                'statusCode': 500,
+                                'body': {
+                                    'message': 'Failed to locate Polly output file',
+                                    'story_id': story_id,
+                                    'polly_task_id': task_id
+                                }
+                            }
+                        
+                        logger.info(f"Found Polly output file: {actual_audio_key}")
+                        
+                        try:
+                            job_settings = get_job_settings()
+                            
+                            job_settings['Settings']['Inputs'] = [{
+                                'AudioSelectors': {
+                                    'Audio Selector 1': {
+                                        'DefaultSelection': 'DEFAULT',
+                                        'SelectorType': 'TRACK',
+                                        'Tracks': [1],
+                                        'Offset': 0
+                                    },
+                                    'Audio Selector 2': {
+                                        'DefaultSelection': 'DEFAULT',
+                                        'ExternalAudioFileInput': f"s3://{OUTPUT_BUCKET}/{actual_audio_key}",
+                                        'SelectorType': 'TRACK',
+                                        'Tracks': [1],
+                                        'Offset': 0,
+                                        'ProgramSelection': 1
+                                    }
+                                },
+                                'AudioSelectorGroups': {
+                                    'Audio Selector Group 1': {
+                                        'AudioSelectorNames': ['Audio Selector 2']
+                                    }
+                                },
+                                'VideoSelector': {},
+                                'TimecodeSource': 'ZEROBASED',
+                                'FileInput': f"s3://{video_bucket}/{video_key}"
+                            }]
+                            
+                            output_key = f"{story_id}/final/final_output"  # Removed .mp4 extension
+                            job_settings['Settings']['OutputGroups'][0]['OutputGroupSettings']['FileGroupSettings']['Destination'] = \
+                                f"s3://{OUTPUT_BUCKET}/{output_key}"
+                            
+                            logger.info(f"Creating MediaConvert job for story_id: {story_id}")
+                            
+                            mediaconvert_response = mediaconvert_client.create_job(**job_settings)
+                            job_id = mediaconvert_response['Job']['Id']
+
+                            success, error = wait_for_mediaconvert_job(
+                                mediaconvert_client,
+                                job_id,
+                                max_attempts=30,
+                                delay=10
+                            )
+
+                            if not success:
+                                return {
+                                    'statusCode': 500,
+                                    'body': {
+                                        'message': f"MediaConvert job failed: {error}",
+                                        'story_id': story_id,
+                                        'job_id': job_id
+                                    }
+                                }
+
+                            # Add additional delay before checking for the file
+                            time.sleep(10)
+
+                            # Verify with retries
+                            success, actual_output_key = verify_file_exists(
+                                s3_client, 
+                                OUTPUT_BUCKET, 
+                                f"{output_key}.mp4", 
+                                max_attempts=10, 
+                                delay=5
+                            )
+                            
+
+                            try:
+                                s3_client = boto3.client('s3')
+                                presigned_url = s3_client.generate_presigned_url(
+                                    'get_object',
+                                    Params={
+                                        'Bucket': OUTPUT_BUCKET,
+                                        'Key': actual_output_key,
+                                    },
+                                    ExpiresIn=43200
+                                )
+                                safe_url = presigned_url.replace('\\', '\\\\').replace('"', '\\"')
+                            
+                                logger.info(f"Generated presigned URL: {presigned_url}")
+                                logger.info(f"Generated safe URL for video (valid for 12 hours) {safe_url}")
+
+                            except Exception as e:
+                                logger.error(f"Error generating presigned URL: {str(e)}")
+                                logger.info(f"Generated presigned URL for video (valid for 12 hours)")
+
+                            if not success:
+                                return {
+                                    'statusCode': 500,
+                                    'body': {
+                                        'message': 'MediaConvert output file not found after retries',
+                                        'story_id': story_id,
+                                        'job_id': job_id,
+                                        'output_location': f"s3://{OUTPUT_BUCKET}/{output_key}.mp4",
+                                        'attempted_paths': [
+                                            f"s3://{OUTPUT_BUCKET}/{output_key}.mp4",
+                                            f"s3://{OUTPUT_BUCKET}/{output_key}.mp4.mp4"
+                                        ]
+                                    }
+                                }
+                            
+                            return {
+                                'statusCode': 200,
+                                'body': {
+                                    'message': 'Processing completed successfully',
+                                    'mediaconvert_job_id': job_id,
+                                    'polly_task_id': task_id,
+                                    'story_id': story_id,
+                                    'video_url': safe_url,
+                                    'input_paths': {
+                                        'video': f"s3://{video_bucket}/{video_key}",
+                                        'audio': f"s3://{OUTPUT_BUCKET}/{actual_audio_key}"
+                                    },
+                                    'output_path': safe_url,
+                                    'status': {
+                                        'polly': 'COMPLETED',
+                                        'mediaconvert': 'COMPLETED'
+                                    }
+                                }
+                            }
+                            
+                        except ClientError as e:
+                            error_message = str(e)
+                            logger.error(f"MediaConvert error: {error_message}")
+                            return {
+                                'statusCode': 500,
+                                'body': {
+                                    'message': f"Error in MediaConvert job creation: {error_message}",
+                                    'story_id': story_id,
+                                    'polly_task_id': task_id
+                                }
+                            }
+                            
+                    except ClientError as e:
+                        error_message = str(e)
+                        logger.error(f"Polly error: {error_message}")
+                        return {
+                            'statusCode': 500,
+                            'body': {
+                                'message': f"Error in Polly synthesis: {error_message}",
+                                'story_id': story_id
+                            }
+                        }
+                        
+                except Exception as e:
+                    error_message = str(e)
+                    logger.error(f"General error: {error_message}")
+                    return {
+                        'statusCode': 500,
+                        'body': {
+                            'message': f"General error: {error_message}",
+                            'story_id': story_id if 'story_id' in locals() else None
+                        }
+                    }
+
+  # Step Functions Definition
+  StatesExecutionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: states.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: LambdaInvoke
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - lambda:InvokeFunction
+                  Resource:
+                    - !GetAtt FirstLambda.Arn
+                    - !GetAtt SecondLambda.Arn
+                    - !GetAtt AudioVideoMergerFunction.Arn
+                    
+
+  StoryProcessingStateMachine:
+      Type: AWS::StepFunctions::StateMachine
+      DependsOn:
+        - FirstLambda
+        - SecondLambda
+        - AudioVideoMergerFunction
+        - StatesExecutionRole
+      Properties:
+        RoleArn: !GetAtt StatesExecutionRole.Arn
+        DefinitionString: !Sub |
+          {
+            "Comment": "Story Generation and Video Creation workflow",
+            "StartAt": "GenerateStory",
+            "States": {
+              "GenerateStory": {
+                "Type": "Task",
+                "Resource": "${FirstLambda.Arn}",
+                "Next": "GenerateVideo",
+                "ResultPath": "$.storyResult",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "HandleError"
+                  }
+                ]
+              },
+              "GenerateVideo": {
+                "Type": "Task",
+                "Resource": "${SecondLambda.Arn}",
+                "Parameters": {
+                  "story_id.$": "$.storyResult.story_id"
+                },
+                "Next": "GenerateAudioVideo",
+                "ResultPath": "$.videoResult",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "HandleError"
+                  }
+                ]
+              },
+              "GenerateAudioVideo": {
+                "Type": "Task",
+                "Resource": "${AudioVideoMergerFunction.Arn}",
+                "Parameters": {
+                  "story_id.$": "$.storyResult.story_id",
+                  "polly_input.$": "$.storyResult.polly_input",
+                  "video_path.$": "$.videoResult.output_location"
+                },
+                "End": true,
+                "ResultPath": "$.audioVideoResult",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "HandleError"
+                  }
+                ]
+              },
+              "HandleError": {
+                "Type": "Pass",
+                "End": true,
+                "ResultPath": "$.error"
+              }
+            }
+          }
+
+
+    # API Gateway Role
+  ApiGatewayRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: apigateway.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: StepFunctionsExecution
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - states:StartExecution
+                    - states:DescribeExecution
+                    - states:GetExecutionHistory
+                  Resource: 
+                    - !Ref StoryProcessingStateMachine
+                    - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${StoryProcessingStateMachine.Name}*
+                    - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${StoryProcessingStateMachine}*
+                    - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${StoryProcessingStateMachine}:*
+
+    # API Gateway Resources
+  Api:
+      Type: AWS::ApiGateway::RestApi
+      Properties:
+        Name: StoryGeneratorAPI
+
+  ApiResource:
+      Type: AWS::ApiGateway::Resource
+      Properties:
+        RestApiId: !Ref Api
+        ParentId: !GetAtt Api.RootResourceId
+        PathPart: generate
+
+  StatusResource:
+      Type: AWS::ApiGateway::Resource
+      Properties:
+        RestApiId: !Ref Api
+        ParentId: !GetAtt Api.RootResourceId
+        PathPart: status
+
+  ApiMethod:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        RestApiId: !Ref Api
+        ResourceId: !Ref ApiResource
+        HttpMethod: POST
+        AuthorizationType: NONE
+        Integration:
+          Type: AWS
+          IntegrationHttpMethod: POST
+          Uri: !Sub arn:aws:apigateway:${AWS::Region}:states:action/StartExecution
+          Credentials: !GetAtt ApiGatewayRole.Arn
+          RequestTemplates:
+            application/json: !Sub |
+              {
+                "stateMachineArn": "${StoryProcessingStateMachine}",
+                "input": "{\"topic\": \"$input.path('$.topic')\"}"
+              }
+          IntegrationResponses:
+            - StatusCode: "200"
+              ResponseParameters:
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+              ResponseTemplates:
+                application/json: |
+                  #set($inputRoot = $input.path('$'))
+                  {
+                    "executionArn": "$inputRoot.executionArn",
+                    "startDate": "$inputRoot.startDate",
+                    "message": "Story generation process started successfully",
+                    "status": "IN_PROGRESS"
+                  }
+        MethodResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+            ResponseModels:
+              application/json: "Empty"
+
+  StatusMethod:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        RestApiId: !Ref Api
+        ResourceId: !Ref StatusResource
+        HttpMethod: GET
+        AuthorizationType: NONE
+        RequestParameters:
+          method.request.querystring.executionArn: true
+        Integration:
+          Type: AWS
+          IntegrationHttpMethod: POST
+          Uri: !Sub arn:aws:apigateway:${AWS::Region}:states:action/DescribeExecution
+          Credentials: !GetAtt ApiGatewayRole.Arn
+          RequestTemplates:
+            application/json: |
+              {
+                "executionArn": "$input.params('executionArn')"
+              }
+          IntegrationResponses:
+            - StatusCode: "200"
+              ResponseParameters:
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+              ResponseTemplates:
+                application/json: |
+                  #set($inputRoot = $input.path('$'))
+                  #if($inputRoot.status == "SUCCEEDED" && $inputRoot.output)
+                      #set($output = $util.parseJson($inputRoot.output))
+                      {
+                          "executionArn": "$inputRoot.executionArn",
+                          "status": "$inputRoot.status",
+                          "startDate": "$inputRoot.startDate",
+                          "stopDate": "$inputRoot.stopDate",
+                          "video_url": "$util.escapeJavaScript($output.audioVideoResult.body.output_path).replaceAll("\\'", "'")",
+                          "story_id": "$output.storyResult.story_id",
+                          "output": {
+                              "story_id": "$output.storyResult.story_id",
+                              "video_status": "$output.videoResult.status",
+                              "final_status": "$output.audioVideoResult.statusCode",
+                              "final_output_location": "$output.audioVideoResult.body.output_path",
+                              "message": "$output.audioVideoResult.body.message"
+                          }
+                      }
+                  #else
+                      {
+                          "executionArn": "$inputRoot.executionArn",
+                          "status": "$inputRoot.status",
+                          "startDate": "$inputRoot.startDate",
+                          #if($inputRoot.stopDate)"stopDate": "$inputRoot.stopDate",#end
+                          "message": "Execution in progress"
+                      }
+                  #end
+        MethodResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+            ResponseModels:
+              application/json: "Empty"
+
+    # CORS Configuration
+  ApiCorsOption:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        AuthorizationType: NONE
+        HttpMethod: OPTIONS
+        Integration:
+          Type: MOCK
+          IntegrationResponses:
+            - StatusCode: "200"
+              ResponseParameters:
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+              ResponseTemplates:
+                application/json: ''
+          PassthroughBehavior: WHEN_NO_MATCH
+          RequestTemplates:
+            application/json: '{"statusCode": 200}'
+        ResourceId: !Ref ApiResource
+        RestApiId: !Ref Api
+        MethodResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: true
+              method.response.header.Access-Control-Allow-Methods: true
+              method.response.header.Access-Control-Allow-Origin: true
+            ResponseModels:
+              application/json: "Empty"
+
+    # API Deployment
+  ApiDeployment:
+      Type: AWS::ApiGateway::Deployment
+      DependsOn: 
+        - ApiMethod
+        - StatusMethod
+        - ApiCorsOption
+      Properties:
+        RestApiId: !Ref Api
+        Description: "Production deployment"
+
+    # API Stage
+  ApiStage:
+      Type: AWS::ApiGateway::Stage
+      Properties:
+        DeploymentId: !Ref ApiDeployment
+        RestApiId: !Ref Api
+        StageName: prod
