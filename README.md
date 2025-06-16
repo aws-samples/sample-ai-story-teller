@@ -231,13 +231,3 @@ The application consists of two main components:
 Contributions are welcome! Please feel free to submit a Pull Request.
 
 ---
-
-## Note About Architecture Diagram
-
-The README references an architecture diagram file (`arch.png`) that should be placed in the root directory. An ASCII representation of the architecture has been provided in `arch.txt`, which you can convert to an image using tools like:
-
-- [Asciiflow](https://asciiflow.com/)
-- [Text to Diagram tools](https://text-to-diagram.com/)
-- Or any diagramming tool of your choice (draw.io, Lucidchart, etc.)
-
-Once you've created the diagram, save it as `arch.png` in the project root directory to have it displayed in the README.
